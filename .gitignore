@@ -1,0 +1,6 @@
+# Ignore local virtual environment
+.venv/
+
+# Usual Python junk
+__pycache__/
+*.pyc
