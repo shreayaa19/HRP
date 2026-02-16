@@ -41,7 +41,11 @@ client.send_message("/bpm", 78.2)
 ```
 
 In this project, the sender is implemented in:
-``` bash code/osc_test.py```
+```bash 
+code/osc_test.py
+```
 
 Example usage:
-``` bash python3 code/osc_test.py --addr /bpm --value 75```
+```bash 
+python3 code/osc_test.py --addr /bpm --value 75
+```
