@@ -11,27 +11,31 @@ def main():
 
     print("[sim] HR simulator running")
 
-    while True:
-        bpm += STEP * direction
+    try:
+        while True:
+            bpm += STEP * direction
 
-        # bounce between limits
-        if bpm >= 100:
-            direction = -1
-        elif bpm <= 70:
-            direction = 1
+            # bounce between limits
+            if bpm >= 100:
+                direction = -1
+            elif bpm <= 70:
+                direction = 1
 
-        msg = {
-            "type": "hr_single",
-            "reading": {
-                "ts_iso": time.time(),
-                "device_id": 99999,
-                "bpm": bpm,
-                "rr_ms": None
+            msg = {
+                "type": "hr_single",
+                "reading": {
+                    "ts_iso": time.time(),
+                    "device_id": 99999,
+                    "bpm": bpm,
+                    "rr_ms": None
+                }
             }
-        }
 
-        print(json.dumps(msg), flush=True)
-        time.sleep(INTERVAL)
+            print(json.dumps(msg), flush=True)
+            time.sleep(INTERVAL)
+
+    except KeyboardInterrupt:
+        print("\n[sim] stopped by user", flush=True)
 
 if __name__ == "__main__":
     main()
