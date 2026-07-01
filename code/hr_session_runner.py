@@ -118,7 +118,7 @@ def main():
             "-u",
             str(ROOT / "code" / "legacy" / "hue_sim_from_hr.py"),
             "--group",
-            "Gallery",
+            "Office",
             "--interval",
             "2.0",
         ]
