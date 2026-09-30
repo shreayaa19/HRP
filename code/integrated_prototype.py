@@ -4,15 +4,24 @@
 Reads newline-delimited heart-rate JSON from stdin, maintains a group BPM,
 and optionally previews/controls Philips Hue, writes CSV, and sends OSC.
 
+Two message types are understood:
+- "hr_single" / "hr_batch": BPM readings -> group average -> Hue / OSC / hr_log CSV
+- "beat": one per heartbeat with the strap-measured R-R interval (ibi_ms)
+  -> ibi_log CSV (one row per beat, for HRV / synchrony analysis).
+  Beats are logged only; lights and sound are still driven by BPM.
+
 Examples
 --------
 Simulation and hardware-free Hue preview:
     python3 code/hr_simulator.py | python3 -u code/integrated_prototype.py \
         --group "Office" --dry-run --mapping dramatic
 
-Real ANT+ input, Hue, and CSV:
-    python3 -u code/ant_hr_to_json.py | python3 -u code/integrated_prototype.py \
-        --group "Office" --ip 192.168.88.118 --hue --csv
+Real ANT+ input, Hue, and CSV (Windows PowerShell, Jeremy's setup):
+    cmd /d /c 'python -u code\\ant_hr_to_json.py | python -u code\\integrated_prototype.py --group Office --ip 192.168.88.48 --hue --csv --mapping smooth --window 3 --interval 1'
+
+Hardware-free R-R/IBI test:
+    python3 -u code/fake_openant_hr.py --fast | python3 -u code/ant_hr_to_json.py --stdin \
+        | python3 -u code/integrated_prototype.py --csv --dry-run
 
 Add OSC:
     ... --osc --osc-ip 127.0.0.1 --osc-port 9000 --osc-addr /bpm
@@ -41,6 +50,28 @@ class Reading:
     device_id: str
     bpm: float
     rr_ms: Any = None
+
+
+@dataclass(frozen=True)
+class Beat:
+    """One heartbeat from one strap, with its strap-measured R-R interval."""
+
+    timestamp: Any
+    t_mono_ms: Any
+    device_id: str
+    beat_count: Any
+    beat_event_time: Any
+    ibi_ms: float | None
+    gap_ms: Any
+    beats_elapsed: Any
+    bpm_reported: Any
+    quality: str
+
+
+IBI_FIELDNAMES = [
+    "timestamp", "t_mono_ms", "device_id", "beat_count", "beat_event_time",
+    "ibi_ms", "gap_ms", "beats_elapsed", "bpm_reported", "quality",
+]
 
 
 @dataclass(frozen=True)
@@ -152,6 +183,36 @@ def extract_readings(message: Any) -> list[Reading]:
     return [reading for item in candidates if (reading := _reading_from_dict(item))]
 
 
+def extract_beat(message: Any) -> Beat | None:
+    """Parse a {"type": "beat", "reading": {...}} message from ant_hr_to_json.py."""
+    if not isinstance(message, dict) or message.get("type") != "beat":
+        return None
+    value = message.get("reading", message.get("data"))
+    if not isinstance(value, dict) or value.get("device_id") is None:
+        return None
+
+    ibi = value.get("ibi_ms")
+    try:
+        ibi_value = float(ibi) if ibi is not None else None
+    except (TypeError, ValueError):
+        ibi_value = None
+    if ibi_value is not None and not math.isfinite(ibi_value):
+        ibi_value = None
+
+    return Beat(
+        timestamp=value.get("ts_iso") or datetime.now(timezone.utc).isoformat(),
+        t_mono_ms=value.get("t_mono_ms"),
+        device_id=str(value["device_id"]),
+        beat_count=value.get("beat_count"),
+        beat_event_time=value.get("beat_event_time"),
+        ibi_ms=ibi_value,
+        gap_ms=value.get("gap_ms"),
+        beats_elapsed=value.get("beats_elapsed"),
+        bpm_reported=value.get("bpm_reported"),
+        quality=str(value.get("quality", "unknown")),
+    )
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -200,21 +261,26 @@ def map_bpm(bpm: float, mapping: str) -> HueState:
     return dramatic_mapping(bpm) if mapping == "dramatic" else smooth_mapping(bpm)
 
 
-def create_csv_writer(csv_dir: str | None) -> tuple[TextIO, csv.DictWriter, Path]:
+def create_csv_writer(
+    csv_dir: str | None,
+    prefix: str = "hr_log",
+    fieldnames: list[str] | None = None,
+) -> tuple[TextIO, csv.DictWriter, Path]:
     directory = Path(csv_dir) if csv_dir else Path.cwd() / "outputs" / "hr_logs"
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = directory / f"hr_log_{stamp}.csv"
+    path = directory / f"{prefix}_{stamp}.csv"
     counter = 2
     while path.exists():
-        path = directory / f"hr_log_{stamp}_{counter}.csv"
+        path = directory / f"{prefix}_{stamp}_{counter}.csv"
         counter += 1
 
     handle = path.open("w", newline="", encoding="utf-8")
-    fieldnames = [
-        "timestamp", "device_id", "bpm", "rr_ms",
-        "group_average_bpm", "output_bpm",
-    ]
+    if fieldnames is None:
+        fieldnames = [
+            "timestamp", "device_id", "bpm", "rr_ms",
+            "group_average_bpm", "output_bpm",
+        ]
     writer = csv.DictWriter(handle, fieldnames=fieldnames)
     writer.writeheader()
     handle.flush()
@@ -234,7 +300,7 @@ def connect_hue(ip: str | None, group_name: str):
     groups = bridge.get_group()
     group_id = next(
         (
-            str(group_id)
+            int(group_id)  # int, not str: phue treats a string as a group NAME
             for group_id, details in groups.items()
             if str(details.get("name", "")).casefold() == group_name.casefold()
         ),
@@ -279,6 +345,10 @@ def main() -> int:
     last_hue_update = float("-inf")
     csv_handle: TextIO | None = None
     csv_writer: csv.DictWriter | None = None
+    ibi_handle: TextIO | None = None
+    ibi_writer: csv.DictWriter | None = None
+    beats_logged = 0
+    beat_quality_counts: dict[str, int] = {}
     bridge = group_id = osc_client = None
 
     print("=" * 46, flush=True)
@@ -294,6 +364,10 @@ def main() -> int:
         if args.csv:
             csv_handle, csv_writer, csv_path = create_csv_writer(args.csv_dir)
             print(f"[csv] logging to {csv_path}", flush=True)
+            ibi_handle, ibi_writer, ibi_path = create_csv_writer(
+                args.csv_dir, prefix="ibi_log", fieldnames=IBI_FIELDNAMES
+            )
+            print(f"[ibi-csv] logging beat-to-beat R-R intervals to {ibi_path}", flush=True)
 
         if args.hue and not args.dry_run:
             print(f"[hue] connecting to bridge at {args.ip or 'auto-discovery'}...", flush=True)
@@ -333,6 +407,35 @@ def main() -> int:
                 # Upstream scripts may print human-readable startup messages.
                 print(f"[input-warning] line={line_number} skipped non-JSON input: {exc.msg}", flush=True)
                 continue
+
+            beat = extract_beat(message)
+            if beat is not None:
+                beats_logged += 1
+                beat_quality_counts[beat.quality] = beat_quality_counts.get(beat.quality, 0) + 1
+                ibi_text = f"{beat.ibi_ms:.1f}" if beat.ibi_ms is not None else "none"
+                print(
+                    f"[beat] device={beat.device_id} count={beat.beat_count} "
+                    f"ibi_ms={ibi_text} quality={beat.quality}",
+                    flush=True,
+                )
+                if ibi_writer is not None and ibi_handle is not None:
+                    ibi_writer.writerow(
+                        {
+                            "timestamp": beat.timestamp,
+                            "t_mono_ms": beat.t_mono_ms,
+                            "device_id": beat.device_id,
+                            "beat_count": beat.beat_count,
+                            "beat_event_time": beat.beat_event_time,
+                            "ibi_ms": beat.ibi_ms,
+                            "gap_ms": beat.gap_ms,
+                            "beats_elapsed": beat.beats_elapsed,
+                            "bpm_reported": beat.bpm_reported,
+                            "quality": beat.quality,
+                        }
+                    )
+                    ibi_handle.flush()
+                    print("[ibi-csv] wrote 1 row", flush=True)
+                continue  # beats are logged only; BPM messages drive Hue/OSC
 
             readings = extract_readings(message)
             if not readings:
@@ -428,6 +531,11 @@ def main() -> int:
     finally:
         if csv_handle is not None:
             csv_handle.close()
+        if ibi_handle is not None:
+            ibi_handle.close()
+        if beats_logged:
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(beat_quality_counts.items()))
+            print(f"[ibi] beats logged: {beats_logged} ({summary})", flush=True)
 
     print("[prototype] stopped.", flush=True)
     return 0
