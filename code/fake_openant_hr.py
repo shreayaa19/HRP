@@ -14,6 +14,8 @@ What it simulates (per strap):
 - Beat event time starting near 64 s so the 16-bit counter rolls over early
 - Beat count rolling over at 256
 - Optional radio dropouts (--drop) so some beats are missed
+- Data page 4 ("previous beat time") on most messages, with an occasional
+  background page in between, like real straps (--no-page4 to turn it off)
 
 Use --truth FILE to save the true intervals and compare them with the CSV.
 """
@@ -39,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Probability each broadcast is lost (e.g. 0.3 to force missed beats)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--truth", help="Write true intervals to this CSV for validation")
+    p.add_argument("--no-page4", action="store_true",
+                   help="Simulate a strap that never sends previous-beat time (page 4)")
     return p
 
 
@@ -54,6 +58,9 @@ class FakeStrap:
         self.next_beat_t = 0.0
         self.last_ibi_ms = base_ibi_ms
         self.bpm = round(60000 / base_ibi_ms)
+        self.prev_event_ticks = (self.event_ticks - round(base_ibi_ms * 1.024)) % 65536
+        self.msg_index = 0
+        self.shown_prev = -1.0  # OpenANT keeps the last page-4 value between pages
 
     def next_ibi_ms(self) -> float:
         # respiratory sinus arrhythmia (~0.25 Hz) + small random variation
@@ -65,6 +72,7 @@ class FakeStrap:
             ibi = self.next_ibi_ms()
             self.t = self.next_beat_t
             ticks = round(ibi * 1024 / 1000)
+            self.prev_event_ticks = self.event_ticks
             self.event_ticks = (self.event_ticks + ticks) % 65536
             self.beat_count = (self.beat_count + 1) % 256
             self.last_ibi_ms = ticks * 1000 / 1024  # quantised like the real strap
@@ -73,13 +81,21 @@ class FakeStrap:
                                round(self.last_ibi_ms, 2)))
             self.next_beat_t += ibi / 1000.0
 
-    def line(self) -> str:
+    def line(self, page4: bool = True) -> str:
+        self.msg_index += 1
+        if page4 and self.msg_index % 16 != 0:
+            # page 4: byte1 = manufacturer specific, bytes 2-3 = previous beat time
+            page_specific = 0xFF | (self.prev_event_ticks << 8)
+            self.shown_prev = self.prev_event_ticks / 1024
+        else:
+            # background page (e.g. page 2: manufacturer id + serial) - prev time is stale
+            page_specific = 0x01 | (12345 << 8)
         return (
             f"Device heart_rate_{self.device_id:05} broadcast heart_rate data: HeartRateData("
-            f"page_specific=16777215, beat_time={self.event_ticks / 1024}, "
+            f"page_specific={page_specific}, beat_time={self.event_ticks / 1024}, "
             f"beat_count={self.beat_count}, heart_rate={self.bpm}, "
             f"operating_time=16777215, manufacturer_id_lsb=255, serial_number=65535, "
-            f"previous_heart_beat_time=-1.0, battery_percentage=255)"
+            f"previous_heart_beat_time={self.shown_prev}, battery_percentage=255)"
         )
 
 
@@ -101,7 +117,7 @@ def main() -> None:
             for s in straps:
                 s.advance_to(t, truth)
                 if rng.random() >= args.drop:
-                    print(s.line(), flush=True)
+                    print(s.line(page4=not args.no_page4), flush=True)
             t += BROADCAST_PERIOD_S
             if not args.fast:
                 time.sleep(BROADCAST_PERIOD_S)

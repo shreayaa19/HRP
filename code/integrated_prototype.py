@@ -9,6 +9,11 @@ Two message types are understood:
 - "beat": one per heartbeat with the strap-measured R-R interval (ibi_ms)
   -> ibi_log CSV (one row per beat, for HRV / synchrony analysis).
   Beats are logged only; lights and sound are still driven by BPM.
+  Rows without a usable interval show ibi_ms = NA. A missed-beat warning is
+  printed only when a strap's recent missed-beat rate exceeds --missed-warn-pct
+  (default 5%), and a per-strap data-quality summary is printed at the end.
+
+Stop with Ctrl+C, or pass --duration SECONDS to stop automatically.
 
 Examples
 --------
@@ -33,6 +38,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -58,6 +64,7 @@ class Beat:
 
     timestamp: Any
     t_mono_ms: Any
+    beat_time_ms: Any
     device_id: str
     beat_count: Any
     beat_event_time: Any
@@ -69,7 +76,7 @@ class Beat:
 
 
 IBI_FIELDNAMES = [
-    "timestamp", "t_mono_ms", "device_id", "beat_count", "beat_event_time",
+    "timestamp", "beat_time_ms", "t_mono_ms", "device_id", "beat_count", "beat_event_time",
     "ibi_ms", "gap_ms", "beats_elapsed", "bpm_reported", "quality",
 ]
 
@@ -116,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preview network/hardware outputs without sending them",
     )
     parser.add_argument(
+        "--duration", "-duration", type=float, default=None,
+        help="Stop automatically after this many seconds (default: run until Ctrl+C)",
+    )
+    parser.add_argument(
+        "--missed-warn-pct", type=float, default=5.0,
+        help="Warn only if a strap misses more than this %% of its recent beats (default: 5)",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true", help="Plain terminal output (no orange warnings)",
+    )
+    parser.add_argument(
         "--mapping", "-mapping", choices=("dramatic", "smooth"),
         default="dramatic", help="BPM-to-light mapping (default: dramatic)",
     )
@@ -127,6 +145,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--interval must be zero or greater")
     if args.window < 1:
         parser.error("--window must be at least 1")
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration must be greater than zero")
+    if not 0 <= args.missed_warn_pct <= 100:
+        parser.error("--missed-warn-pct must be between 0 and 100")
     if not 1 <= args.osc_port <= 65535:
         parser.error("--osc-port must be between 1 and 65535")
 
@@ -202,6 +224,7 @@ def extract_beat(message: Any) -> Beat | None:
     return Beat(
         timestamp=value.get("ts_iso") or datetime.now(timezone.utc).isoformat(),
         t_mono_ms=value.get("t_mono_ms"),
+        beat_time_ms=value.get("beat_time_ms"),
         device_id=str(value["device_id"]),
         beat_count=value.get("beat_count"),
         beat_event_time=value.get("beat_event_time"),
@@ -211,6 +234,75 @@ def extract_beat(message: Any) -> Beat | None:
         bpm_reported=value.get("bpm_reported"),
         quality=str(value.get("quality", "unknown")),
     )
+
+
+ORANGE = "\033[38;5;208m"
+RESET = "\033[0m"
+
+
+class MissedBeatMonitor:
+    """Tracks, per strap, what share of beats had no usable R-R interval.
+
+    Every beat row is still flagged in the CSV; this only decides when to WARN,
+    so occasional radio dropouts don't spam the terminal.
+    """
+
+    WINDOW_BEATS = 60  # judge the recent rate over roughly the last minute
+
+    def __init__(self, threshold_pct: float, color: bool) -> None:
+        self.threshold = threshold_pct
+        self.color = color
+        self.recent: dict[str, deque[int]] = {}   # 1 = beat had no interval, 0 = ok
+        self.total: dict[str, int] = {}
+        self.missed: dict[str, int] = {}
+        self.warning_active: dict[str, bool] = {}
+
+    def paint(self, text: str) -> str:
+        return f"{ORANGE}{text}{RESET}" if self.color else text
+
+    def add(self, beat: "Beat") -> str | None:
+        """Record a beat row; return a warning line only when the threshold is crossed."""
+        n = beat.beats_elapsed if isinstance(beat.beats_elapsed, int) and beat.beats_elapsed > 0 else 1
+        no_interval = 1 if beat.ibi_ms is None else 0
+        dev = beat.device_id
+        window = self.recent.setdefault(dev, deque(maxlen=self.WINDOW_BEATS))
+        for _ in range(n):
+            window.append(no_interval)
+        self.total[dev] = self.total.get(dev, 0) + n
+        self.missed[dev] = self.missed.get(dev, 0) + n * no_interval
+
+        if len(window) < 20:  # too early to judge
+            return None
+        pct = 100.0 * sum(window) / len(window)
+        active = self.warning_active.get(dev, False)
+        if pct > self.threshold and not active:
+            self.warning_active[dev] = True
+            return self.paint(
+                f"[ibi-warning] device={dev}: {pct:.0f}% of the last {len(window)} beats "
+                f"had no interval (threshold {self.threshold:g}%). Check strap contact and "
+                f"dongle distance/line of sight."
+            )
+        if pct <= self.threshold / 2 and active:
+            self.warning_active[dev] = False
+            return f"[ibi] device={dev}: missed-beat rate back to {pct:.0f}%"
+        return None
+
+    def summary_lines(self) -> list[str]:
+        lines = []
+        for dev in sorted(self.total):
+            total, missed = self.total[dev], self.missed[dev]
+            pct = 100.0 * missed / total if total else 0.0
+            status = "OK" if pct <= self.threshold else "CHECK"
+            line = (f"[ibi-summary] device={dev} beats={total} without_interval={missed} "
+                    f"({pct:.1f}%) -> {status}")
+            lines.append(self.paint(line) if status == "CHECK" else line)
+        return lines
+
+
+def enable_windows_ansi() -> None:
+    """Let Windows consoles show colors (no-op elsewhere)."""
+    if os.name == "nt":
+        os.system("")
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -349,6 +441,11 @@ def main() -> int:
     ibi_writer: csv.DictWriter | None = None
     beats_logged = 0
     beat_quality_counts: dict[str, int] = {}
+    color = not args.no_color and sys.stdout.isatty()
+    if color:
+        enable_windows_ansi()
+    missed_monitor = MissedBeatMonitor(args.missed_warn_pct, color)
+    started = time.monotonic()
     bridge = group_id = osc_client = None
 
     print("=" * 46, flush=True)
@@ -397,7 +494,13 @@ def main() -> int:
 
         print("[input] listening for newline-delimited HR JSON on stdin", flush=True)
 
+        if args.duration is not None:
+            print(f"[session] will stop automatically after {args.duration:g}s", flush=True)
+
         for line_number, line in enumerate(sys.stdin, start=1):
+            if args.duration is not None and time.monotonic() - started >= args.duration:
+                print(f"[session] {args.duration:g}s reached; stopping", flush=True)
+                break
             line = line.strip()
             if not line:
                 continue
@@ -412,21 +515,26 @@ def main() -> int:
             if beat is not None:
                 beats_logged += 1
                 beat_quality_counts[beat.quality] = beat_quality_counts.get(beat.quality, 0) + 1
-                ibi_text = f"{beat.ibi_ms:.1f}" if beat.ibi_ms is not None else "none"
-                print(
+                ibi_text = f"{beat.ibi_ms:.1f}" if beat.ibi_ms is not None else "NA"
+                beat_line = (
                     f"[beat] device={beat.device_id} count={beat.beat_count} "
-                    f"ibi_ms={ibi_text} quality={beat.quality}",
-                    flush=True,
+                    f"ibi_ms={ibi_text} quality={beat.quality}"
                 )
+                print(missed_monitor.paint(beat_line) if beat.ibi_ms is None else beat_line,
+                      flush=True)
+                warning = missed_monitor.add(beat)
+                if warning:
+                    print(warning, flush=True)
                 if ibi_writer is not None and ibi_handle is not None:
                     ibi_writer.writerow(
                         {
                             "timestamp": beat.timestamp,
+                            "beat_time_ms": beat.beat_time_ms,
                             "t_mono_ms": beat.t_mono_ms,
                             "device_id": beat.device_id,
                             "beat_count": beat.beat_count,
                             "beat_event_time": beat.beat_event_time,
-                            "ibi_ms": beat.ibi_ms,
+                            "ibi_ms": beat.ibi_ms if beat.ibi_ms is not None else "NA",
                             "gap_ms": beat.gap_ms,
                             "beats_elapsed": beat.beats_elapsed,
                             "bpm_reported": beat.bpm_reported,
@@ -536,6 +644,8 @@ def main() -> int:
         if beats_logged:
             summary = ", ".join(f"{k}={v}" for k, v in sorted(beat_quality_counts.items()))
             print(f"[ibi] beats logged: {beats_logged} ({summary})", flush=True)
+            for line in missed_monitor.summary_lines():
+                print(line, flush=True)
 
     print("[prototype] stopped.", flush=True)
     return 0

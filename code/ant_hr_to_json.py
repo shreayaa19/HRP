@@ -16,58 +16,72 @@ What this script does
 ---------------------
 - Runs `python -m openant scan --device_type HeartRate --auto_create`
   (or, with --stdin, reads the same text output from stdin).
-- Parses each HeartRateData broadcast line for device_id, heart_rate,
-  beat_time (heart-beat event time) and beat_count.
+- Parses each HeartRateData broadcast line.
 - Emits TWO kinds of JSON line on stdout:
 
   1. "hr_single" - one per ANT+ broadcast (~4 per second per strap), BPM only.
-     Unchanged from before, so the Hue/OSC/BPM-CSV path keeps working:
+     Unchanged, so the Hue/OSC/BPM-CSV path keeps working.
 
-       {"type": "hr_single",
-        "reading": {"ts_iso": "...", "device_id": 51861, "bpm": 88, "rr_ms": null}}
-
-  2. "beat" - one per NEW heartbeat (only when beat_count changes). This is the
-     R-R / inter-beat-interval (IBI) record for research analysis:
+  2. "beat" - one per heartbeat, with the strap-measured R-R / inter-beat
+     interval (IBI) for research analysis:
 
        {"type": "beat",
-        "reading": {"ts_iso": "...", "t_mono_ms": 123456.7, "device_id": 51861,
-                    "beat_count": 88, "beat_event_time": 40321,
-                    "ibi_ms": 812.5, "bpm_reported": 74,
-                    "beats_elapsed": 1, "quality": "ok"}}
+        "reading": {"ts_iso": "...", "t_mono_ms": 123456.7, "beat_time_ms": 123301.2,
+                    "device_id": 51861, "beat_count": 88, "beat_event_time": 40321,
+                    "ibi_ms": 812.5, "gap_ms": 812.5, "beats_elapsed": 1,
+                    "bpm_reported": 74, "quality": "ok"}}
 
 How the IBI is computed (ANT+ Heart Rate profile)
 ------------------------------------------------
 - "Heart beat event time" is a 16-bit counter in 1/1024 s ticks that wraps
-  every 64 s (65536 ticks). OpenANT prints it as beat_time in seconds
-  (ticks / 1024), so we convert back to integer ticks.
-- "Heart beat count" is an 8-bit counter (wraps at 256) that goes up by one
-  per detected beat. The strap repeats the same beat in several broadcasts,
-  so a beat is only "new" when the count changes.
+  every 64 s. OpenANT prints it as beat_time in seconds (ticks / 1024).
+- "Heart beat count" is an 8-bit counter (wraps at 256), +1 per beat. The strap
+  repeats the same beat in several broadcasts, so a beat is "new" only when the
+  count changes.
 - IBI (ms) = ((this_event_time - previous_event_time) mod 65536) * 1000 / 1024.
-  The modulo handles counter rollover. This is measured by the strap - it is
-  NOT estimated from BPM.
+  Measured by the strap; NOT estimated from BPM.
+
+Recovering a missed beat (data page 4)
+--------------------------------------
+Most straps also send the time of the PREVIOUS beat (page 4). If radio packets
+are lost and the count jumps by 2, that field lets us rebuild both intervals
+instead of losing them. Rebuilt rows are marked quality = "recovered". The
+field is only trusted when it is fresh (it matches the raw page bytes) and
+fits exactly between the two known beats.
+
+Single shared clock (beat_time_ms)
+----------------------------------
+t_mono_ms is when the computer RECEIVED the message (up to ~250 ms after the
+beat, because straps broadcast ~4x per second). beat_time_ms estimates when the
+beat actually HAPPENED, on the computer's monotonic clock shared by all straps:
+the strap's own beat times are mapped onto the computer clock using the
+smallest observed receive delay over the last ~60 s. It settles within the first
+~30 s of a session; after that it is typically within ~10-20 ms of the true
+beat (vs. up to ~250 ms+ for t_mono_ms). Use beat_time_ms to line up different
+people's beats.
 
 Quality flags on each beat row
 ------------------------------
-  ok            - exactly one new beat since the last one; ibi_ms is the R-R interval
-  missed_beats  - the count jumped by more than 1 (radio dropout). ibi_ms is null
-                  because the gap spans several beats; gap_ms and beats_elapsed
-                  keep the information for later handling
-  out_of_range  - interval outside 300-2000 ms (physiologically implausible);
-                  value kept but flagged
-Streams are reset (no interval computed) after more than 60 s without a new beat,
-because the 64 s counter could have wrapped an unknown number of times.
+  ok            - one new beat since the last one; ibi_ms is the R-R interval
+  recovered     - interval rebuilt from page-4 "previous beat time" after a lost packet
+  missed_beats  - the gap spans 2+ beats that couldn't be rebuilt. ibi_ms = NA;
+                  gap_ms and beats_elapsed keep the information
+  out_of_range  - interval outside 300-2000 ms (implausible); value kept but flagged
+Streams reset (no interval) after > 60 s without a new beat, because the 64 s
+counter could have wrapped an unknown number of times.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -83,98 +97,148 @@ IBI_MAX_MS = 2000.0  # ~30 BPM
 # If no new beat arrives for this long, don't trust the wrapped event-time counter
 STALE_RESET_S = 60.0
 
-# Device id: OpenANT prints the device as e.g. "heart_rate_51861"
+# Window (seconds) of receive-delay observations used to map strap time -> computer time
+CLOCK_WINDOW_S = 60.0
+
 DEVICE_RE = re.compile(r"heart_rate_(\d+)", re.IGNORECASE)
-# Fields inside the printed HeartRateData(...) dataclass
 FIELD_RES = {
     "heart_rate": re.compile(r"\bheart_rate=(\d+)"),
     "beat_time": re.compile(r"\bbeat_time=(-?[\d.]+)"),
     "beat_count": re.compile(r"\bbeat_count=(\d+)"),
+    "page_specific": re.compile(r"\bpage_specific=(\d+)"),
+    "previous_heart_beat_time": re.compile(r"\bprevious_heart_beat_time=(-?[\d.]+)"),
 }
 
 
-@dataclass
-class DeviceBeatState:
-    """Last beat seen for one strap."""
-
-    event_ticks: int
-    beat_count: int
-    t_mono: float
-
-
 def parse_openant_line(line: str) -> dict | None:
-    """Pull device_id, heart_rate, beat_time, beat_count out of one OpenANT line.
-
-    Returns None for lines that aren't heart-rate data broadcasts.
-    beat_time / beat_count are None if this OpenANT version doesn't print them.
-    """
+    """Pull the heart-rate fields out of one OpenANT line (None if not HR data)."""
     device_match = DEVICE_RE.search(line)
     hr_match = FIELD_RES["heart_rate"].search(line)
     if not device_match or not hr_match:
         return None
 
-    parsed = {
+    def num(key: str, cast):
+        m = FIELD_RES[key].search(line)
+        return cast(m.group(1)) if m else None
+
+    beat_time = num("beat_time", float)
+    prev_time = num("previous_heart_beat_time", float)
+    return {
         "device_id": int(device_match.group(1)),
         "heart_rate": int(hr_match.group(1)),
-        "beat_time": None,
-        "beat_count": None,
+        # OpenANT uses -1.0 as "not received yet"
+        "beat_time": beat_time if beat_time is not None and beat_time >= 0 else None,
+        "beat_count": num("beat_count", int),
+        "page_specific": num("page_specific", int),
+        "prev_beat_time": prev_time if prev_time is not None and prev_time >= 0 else None,
     }
-    bt = FIELD_RES["beat_time"].search(line)
-    bc = FIELD_RES["beat_count"].search(line)
-    if bt:
-        beat_time_s = float(bt.group(1))
-        if beat_time_s >= 0:  # OpenANT uses -1.0 as "not received yet"
-            parsed["beat_time"] = beat_time_s
-    if bc:
-        parsed["beat_count"] = int(bc.group(1))
-    return parsed
+
+
+def fresh_prev_ticks(parsed: dict) -> int | None:
+    """Return page-4 previous-beat time (ticks) only if it came from THIS message.
+
+    OpenANT keeps the last page-4 value around even when other pages arrive, so we
+    check it against the raw page bytes: on page 4, page_specific = byte1 | prev<<8.
+    """
+    prev_s, page_specific = parsed.get("prev_beat_time"), parsed.get("page_specific")
+    if prev_s is None or page_specific is None:
+        return None
+    prev_ticks = round(prev_s * TICKS_PER_SECOND) % EVENT_TIME_ROLLOVER
+    return prev_ticks if ((page_specific >> 8) & 0xFFFF) == prev_ticks else None
+
+
+@dataclass
+class DeviceBeatState:
+    event_ticks: int            # strap time of latest beat (wrapped, 0-65535)
+    beat_count: int
+    last_new_beat_mono: float   # computer time we last saw a new beat
+    unwrapped_s: float          # strap time of latest beat, unwrapped, in seconds
+    delays: deque = field(default_factory=deque)  # (t_recv, t_recv - unwrapped_s)
 
 
 class IbiTracker:
-    """Turns repeated ANT+ broadcasts into one record per new heartbeat, per device."""
+    """Turns repeated ANT+ broadcasts into one record per heartbeat, per device."""
 
     def __init__(self) -> None:
         self.state: dict[int, DeviceBeatState] = {}
 
-    def update(
-        self, device_id: int, beat_time_s: float, beat_count: int, bpm: int, t_mono: float
-    ) -> dict | None:
-        event_ticks = round(beat_time_s * TICKS_PER_SECOND) % EVENT_TIME_ROLLOVER
-        prev = self.state.get(device_id)
+    @staticmethod
+    def _offset(st: DeviceBeatState, t_recv: float) -> float:
+        """Strap->computer clock offset: smallest receive delay in the recent window."""
+        st.delays.append((t_recv, t_recv - st.unwrapped_s))
+        while st.delays and t_recv - st.delays[0][0] > CLOCK_WINDOW_S:
+            st.delays.popleft()
+        return min(d for _, d in st.delays)
 
-        # First sighting of this strap, or it has been silent too long: start fresh.
-        if prev is None or (t_mono - prev.t_mono) > STALE_RESET_S:
-            self.state[device_id] = DeviceBeatState(event_ticks, beat_count, t_mono)
-            return None
+    def update(self, parsed: dict, t_recv: float) -> list[dict]:
+        device_id = parsed["device_id"]
+        bpm = parsed["heart_rate"]
+        beat_count = parsed["beat_count"]
+        event_ticks = round(parsed["beat_time"] * TICKS_PER_SECOND) % EVENT_TIME_ROLLOVER
+        st = self.state.get(device_id)
 
-        beats_elapsed = (beat_count - prev.beat_count) % BEAT_COUNT_ROLLOVER
+        # First sighting, or silent too long: start fresh (no interval yet).
+        if st is None or (t_recv - st.last_new_beat_mono) > STALE_RESET_S:
+            st = DeviceBeatState(event_ticks, beat_count, t_recv, event_ticks / TICKS_PER_SECOND)
+            self.state[device_id] = st
+            self._offset(st, t_recv)
+            return []
+
+        beats_elapsed = (beat_count - st.beat_count) % BEAT_COUNT_ROLLOVER
         if beats_elapsed == 0:
-            return None  # same beat re-broadcast; nothing new
+            self._offset(st, t_recv)  # repeated beat still improves the clock estimate
+            return []
 
-        gap_ticks = (event_ticks - prev.event_ticks) % EVENT_TIME_ROLLOVER
-        gap_ms = gap_ticks * 1000.0 / TICKS_PER_SECOND
+        gap_ticks = (event_ticks - st.event_ticks) % EVENT_TIME_ROLLOVER
+        start_unwrapped = st.unwrapped_s
 
-        if beats_elapsed == 1:
-            ibi_ms: float | None = round(gap_ms, 2)
-            quality = "ok" if IBI_MIN_MS <= gap_ms <= IBI_MAX_MS else "out_of_range"
-        else:
-            ibi_ms = None
-            quality = "missed_beats"
+        # Segments between known beat times: (ticks, beats_in_segment, recovered?)
+        segments: list[tuple[int, int, bool]] = [(gap_ticks, beats_elapsed, False)]
+        prev_ticks = fresh_prev_ticks(parsed)
+        if beats_elapsed >= 2 and prev_ticks is not None:
+            d1 = (prev_ticks - st.event_ticks) % EVENT_TIME_ROLLOVER
+            d2 = (event_ticks - prev_ticks) % EVENT_TIME_ROLLOVER
+            if 0 < d1 < gap_ticks and d1 + d2 == gap_ticks:
+                segments = [(d1, beats_elapsed - 1, True), (d2, 1, True)]
 
-        self.state[device_id] = DeviceBeatState(event_ticks, beat_count, t_mono)
+        st.event_ticks = event_ticks
+        st.beat_count = beat_count
+        st.last_new_beat_mono = t_recv
+        st.unwrapped_s = start_unwrapped + gap_ticks / TICKS_PER_SECOND
+        offset = self._offset(st, t_recv)
 
-        return {
-            "ts_iso": datetime.now(timezone.utc).isoformat(),
-            "t_mono_ms": round(t_mono * 1000.0, 1),
-            "device_id": device_id,
-            "beat_count": beat_count,
-            "beat_event_time": event_ticks,
-            "ibi_ms": ibi_ms,
-            "gap_ms": round(gap_ms, 2),
-            "beats_elapsed": beats_elapsed,
-            "bpm_reported": bpm,
-            "quality": quality,
-        }
+        rows = []
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        elapsed_ticks = 0
+        counted = 0
+        for ticks, n_beats, recovered in segments:
+            elapsed_ticks += ticks
+            counted += n_beats
+            gap_ms = ticks * 1000.0 / TICKS_PER_SECOND
+            if n_beats == 1:
+                ibi_ms: float | None = round(gap_ms, 2)
+                if not IBI_MIN_MS <= gap_ms <= IBI_MAX_MS:
+                    quality = "out_of_range"
+                else:
+                    quality = "recovered" if recovered else "ok"
+            else:
+                ibi_ms, quality = None, "missed_beats"
+
+            beat_unwrapped = start_unwrapped + elapsed_ticks / TICKS_PER_SECOND
+            rows.append({
+                "ts_iso": ts_iso,
+                "t_mono_ms": round(t_recv * 1000.0, 1),
+                "beat_time_ms": round((beat_unwrapped + offset) * 1000.0, 1),
+                "device_id": device_id,
+                "beat_count": (beat_count - beats_elapsed + counted) % BEAT_COUNT_ROLLOVER,
+                "beat_event_time": (st.event_ticks - gap_ticks + elapsed_ticks) % EVENT_TIME_ROLLOVER,
+                "ibi_ms": ibi_ms,
+                "gap_ms": round(gap_ms, 2),
+                "beats_elapsed": n_beats,
+                "bpm_reported": bpm,
+                "quality": quality,
+            })
+        return rows
 
 
 def emit(payload: dict, label: str) -> None:
@@ -195,12 +259,10 @@ def process_lines(lines: Iterable[str]) -> None:
         if parsed is None:
             continue
 
-        device_id = parsed["device_id"]
-        heart_rate = parsed["heart_rate"]
-        t_mono = time.monotonic()
+        t_recv = time.monotonic()
+        device_id, heart_rate = parsed["device_id"], parsed["heart_rate"]
         print(f"[match] device={device_id} hr={heart_rate}", file=sys.stderr)
 
-        # 1) BPM message - same shape as before
         emit(
             {
                 "type": "hr_single",
@@ -214,7 +276,6 @@ def process_lines(lines: Iterable[str]) -> None:
             "json",
         )
 
-        # 2) Beat message - only when a new heartbeat is detected
         if parsed["beat_time"] is None or parsed["beat_count"] is None:
             if not warned_no_beat_fields:
                 print(
@@ -225,10 +286,7 @@ def process_lines(lines: Iterable[str]) -> None:
                 warned_no_beat_fields = True
             continue
 
-        beat = tracker.update(
-            device_id, parsed["beat_time"], parsed["beat_count"], heart_rate, t_mono
-        )
-        if beat is not None:
+        for beat in tracker.update(parsed, t_recv):
             emit({"type": "beat", "reading": beat}, "beat")
 
 
@@ -243,6 +301,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _quiet_exit_on_closed_pipe() -> None:
+    """The downstream script stopped (e.g. --duration ended): exit without a traceback."""
+    print("\n=== hr_to_json: downstream closed, stopping ===", file=sys.stderr)
+    try:
+        sys.stdout = open(os.devnull, "w")
+    except Exception:
+        pass
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
@@ -252,6 +319,8 @@ def main() -> None:
             process_lines(sys.stdin)
         except KeyboardInterrupt:
             print("\n=== hr_to_json: received Ctrl+C, stopping ===", file=sys.stderr)
+        except (BrokenPipeError, OSError):
+            _quiet_exit_on_closed_pipe()
         return
 
     cmd = [
@@ -276,6 +345,8 @@ def main() -> None:
         process_lines(proc.stdout)
     except KeyboardInterrupt:
         print("\n=== hr_to_json: received Ctrl+C, stopping ===", file=sys.stderr)
+    except (BrokenPipeError, OSError):
+        _quiet_exit_on_closed_pipe()
     finally:
         try:
             proc.terminate()
