@@ -18,6 +18,11 @@ What it simulates (per strap):
   background page in between, like real straps (--no-page4 to turn it off)
 
 Use --truth FILE to save the true intervals and compare them with the CSV.
+
+--scenario show (for the Pulse Relay light show): each wearer's heart rate wanders
+on its own for ~90 s, then everyone shares a slow common rhythm for ~80 s (as in a
+shared activity), and so on - so the group-synchrony colour has something to find.
+--speed N runs the simulation N times faster than real time (e.g. --speed 6).
 """
 
 from __future__ import annotations
@@ -41,14 +46,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Probability each broadcast is lost (e.g. 0.3 to force missed beats)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--truth", help="Write true intervals to this CSV for validation")
+    p.add_argument("--scenario", choices=("rsa", "show"), default="rsa",
+                   help="rsa = steady breathing rhythm (default); show = alternating apart/together")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="Run N times faster than real time (ignored with --fast)")
     p.add_argument("--no-page4", action="store_true",
                    help="Simulate a strap that never sends previous-beat time (page 4)")
     return p
 
 
 class FakeStrap:
-    def __init__(self, device_id: int, base_ibi_ms: float, rng: random.Random) -> None:
+    def __init__(self, device_id: int, base_ibi_ms: float, rng: random.Random,
+                 scenario: str = "rsa") -> None:
         self.device_id = device_id
+        self.scenario = scenario
+        self.walk = 0.0  # individual slow drift in bpm (show scenario)
         self.base = base_ibi_ms
         self.rng = rng
         self.t = 0.0
@@ -62,7 +74,26 @@ class FakeStrap:
         self.msg_index = 0
         self.shown_prev = -1.0  # OpenANT keeps the last page-4 value between pages
 
+    @staticmethod
+    def togetherness(t: float) -> float:
+        """0 = apart, 1 = sharing a rhythm. 3-minute cycle: ~90 s apart, ~80 s together."""
+        phase = t % 180.0
+        if phase < 90:
+            return 0.0
+        if phase < 100:
+            return 0.5 - 0.5 * math.cos(math.pi * (phase - 90) / 10)
+        if phase < 170:
+            return 1.0
+        return 0.5 + 0.5 * math.cos(math.pi * (phase - 170) / 10)
+
     def next_ibi_ms(self) -> float:
+        if self.scenario == "show":
+            base_hr = 60000.0 / self.base
+            self.walk += self.rng.gauss(0, 0.9) - 0.04 * self.walk   # individual drift
+            w = self.togetherness(self.t)
+            common = 8.0 * math.sin(2 * math.pi * self.t / 30.0)       # shared slow rhythm
+            hr = base_hr + (1 - w) * self.walk + w * common
+            return max(350.0, 60000.0 / max(hr, 40.0) + self.rng.gauss(0, 10))
         # respiratory sinus arrhythmia (~0.25 Hz) + small random variation
         rsa = 40.0 * math.sin(2 * math.pi * 0.25 * self.t)
         return max(350.0, self.base + rsa + self.rng.gauss(0, 15))
@@ -103,7 +134,8 @@ def main() -> None:
     args = build_parser().parse_args()
     rng = random.Random(args.seed)
     ids = [int(x) for x in args.devices.split(",") if x.strip()]
-    straps = [FakeStrap(d, base_ibi_ms=780 + 90 * i, rng=rng) for i, d in enumerate(ids)]
+    straps = [FakeStrap(d, base_ibi_ms=780 + 90 * i, rng=rng, scenario=args.scenario)
+              for i, d in enumerate(ids)]
     truth: list = []
 
     print("Starting scanner for #0, type 120, press Ctrl-C to finish", flush=True)
@@ -120,7 +152,7 @@ def main() -> None:
                     print(s.line(page4=not args.no_page4), flush=True)
             t += BROADCAST_PERIOD_S
             if not args.fast:
-                time.sleep(BROADCAST_PERIOD_S)
+                time.sleep(BROADCAST_PERIOD_S / max(args.speed, 0.01))
     except (KeyboardInterrupt, BrokenPipeError):
         pass
 

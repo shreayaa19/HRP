@@ -1,0 +1,22 @@
+{
+  "_comment": "Pulse Relay show settings. Fill in bridge_ip and the four light names (run --list-lights). device_id can stay null: monitors are assigned to visitor slots in the order they appear. Colours: HRP visual identity swatch (Angie Ko).",
+  "bridge_ip": null,
+  "visitors": [
+    {"name": "Visitor 1", "color": "#FF2DD1", "light": "Strip 1", "device_id": null},
+    {"name": "Visitor 2", "color": "#7A00FF", "light": "Strip 2", "device_id": null},
+    {"name": "Visitor 3", "color": "#FFDD00", "light": "Strip 3", "device_id": null},
+    {"name": "Visitor 4", "color": "#00C8FF", "light": "Strip 4", "device_id": null}
+  ],
+  "sync_color": "#39DF14",
+  "baseline_seconds": 45,
+  "full_scale_bpm": 20,
+  "min_brightness": 40,
+  "max_brightness": 254,
+  "idle_brightness": 25,
+  "sync_window_seconds": 60,
+  "sync_low": 0.3,
+  "sync_high": 0.7,
+  "sync_max_blend": 0.85,
+  "stale_seconds": 10,
+  "update_interval": 1.0
+}
