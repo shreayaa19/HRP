@@ -20,15 +20,15 @@ window (default 60 s) so the room can respond within a minute.
 
 Run (Windows / PowerShell, real straps, from the project folder with .venv active):
 
-    cmd /d /c 'python -u code\\ant_hr_to_json.py | python -u code\\pulse_relay_show.py --config code\\pulse_relay_config.json --hue --csv'
+    cmd /d /c 'python -u code\\ant_hr_to_json.py | python -u code\\pulse_relay_show_v1.py --config code\\pulse_relay_config.json --hue --csv'
 
 Find the light names first:
 
-    python code\\pulse_relay_show.py --config code\\pulse_relay_config.json --list-lights
+    python code\\pulse_relay_show_v1.py --config code\\pulse_relay_config.json --list-lights
 
 Rehearse without any hardware (coloured preview bars in the terminal, 6x speed):
 
-    python -u code/fake_openant_hr.py --devices 51861,51950,52001,52002 --scenario show --seconds 600 --speed 6 | python -u code/ant_hr_to_json.py --stdin | python -u code/pulse_relay_show.py --preview --time-scale 6
+    python -u code/fake_openant_hr.py --devices 51861,51950,52001,52002 --scenario show --seconds 600 --speed 6 | python -u code/ant_hr_to_json.py --stdin | python -u code/pulse_relay_show_v1.py --preview --time-scale 6
 """
 
 from __future__ import annotations
@@ -181,7 +181,7 @@ class HueOut:
 
 
 def preview_bar(v: Visitor, rgb, bri: int, active: bool, bpm: float | None) -> str:
-    scale = bri / 254
+    scale = 0.35 + 0.65 * bri / 254  # preview only: keep dim strips visible on screen
     r, g, b = (int(255 * c * scale) for c in rgb)
     label = f"{v.name[:10]:<10} {('%5.1f bpm' % bpm) if (active and bpm) else '  waiting'}"
     return f"\033[48;2;{r};{g};{b}m{' ' * 14}\033[0m {label}"
